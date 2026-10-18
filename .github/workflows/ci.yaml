@@ -1,0 +1,117 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# Least privilege by default; the image job asks for packages: write itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Makefile pins these for the author's environment (a broken internal
+  # proxy). CI talks to the public defaults instead.
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  GOTOOLCHAIN: local
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reported unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # GOOS must be set explicitly: the cephfs implementation is behind a
+      # linux build tag, so a host-only vet would silently skip it.
+      - name: vet (linux/amd64)
+        run: GOOS=linux GOARCH=amd64 go vet ./...
+
+      - name: build (linux/amd64)
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
+
+      # The non-linux stub exists so the tree compiles on a workstation; keep it
+      # compiling or it will rot unnoticed.
+      - name: build (windows/amd64)
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+
+      - name: unit tests
+        run: go test ./... -count=1
+
+      - name: generated bundles are up to date
+        run: |
+          python3 hack/bundle.py
+          if ! git diff --exit-code -- deploy/; then
+            echo "::error::deploy/ is stale: run 'make bundle' and commit the result"
+            exit 1
+          fi
+
+  image:
+    name: image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The cluster is amd64-only; a multi-arch build would just cost QEMU
+          # time for nothing.
+          platforms: linux/amd64
+          # Pull requests build the image to prove the Dockerfile still works,
+          # but never publish it.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

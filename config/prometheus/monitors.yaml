@@ -1,0 +1,43 @@
+# Scrape configuration in VictoriaMetrics operator form.
+#
+# These used to be a PodMonitor and a ServiceMonitor (monitoring.coreos.com),
+# which the VictoriaMetrics operator does not consume. The equivalent objects
+# are VMPodScrape / VMServiceScrape. They live outside deploy/install.yaml
+# (see hack/bundle.py) because applying them on a cluster that has no
+# vmoperator CRDs would fail the whole bundle.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: statfs-guard-agent
+  namespace: statfs-guard
+  labels:
+    app.kubernetes.io/part-of: statfs-guard
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: statfs-guard-agent
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 60s
+      # Deliberately no relabeling here. Every series the agent exports already
+      # carries its own `node` label (os.Hostname()), so rewriting
+      # __meta_kubernetes_pod_node_name into `node` as well would only add a
+      # conflicting target label — exported as `exported_node` when the two
+      # differ, as they do whenever hostname is not exactly the node name.
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: statfs-guard-manager
+  namespace: statfs-guard
+  labels:
+    app.kubernetes.io/part-of: statfs-guard
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: statfs-guard-manager
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 60s

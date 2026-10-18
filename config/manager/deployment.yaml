@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statfs-guard-manager
+  namespace: statfs-guard
+  labels:
+    app.kubernetes.io/name: statfs-guard-manager
+    app.kubernetes.io/part-of: statfs-guard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: statfs-guard-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: statfs-guard-manager
+        app.kubernetes.io/part-of: statfs-guard
+    spec:
+      serviceAccountName: statfs-guard-manager
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: manager
+          image: ghcr.io/zzhkhyl/statfs-guard-operator:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/manager"]
+          args:
+            - --leader-elect=true
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --agent-namespace=statfs-guard
+            - --agent-selector=app.kubernetes.io/name=statfs-guard-agent
+            - --agent-port=9101
+            - --drift-min-bytes=67108864
+            - --drift-min-ratio=0.05
+            - --auto-heal=true
+            - --resync-interval=5m
+            - --verify-interval=60s
+            # --storage-classes=cephfs-hdd,cephfs-ssd
+            # --exclude-namespaces=kube-system
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statfs-guard-manager-metrics
+  namespace: statfs-guard
+  labels:
+    app.kubernetes.io/name: statfs-guard-manager
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: statfs-guard-manager
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics

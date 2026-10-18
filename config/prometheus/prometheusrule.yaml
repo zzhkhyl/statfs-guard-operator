@@ -1,0 +1,112 @@
+# Alerting rules in VictoriaMetrics operator form (VMRule instead of the
+# monitoring.coreos.com PrometheusRule). Applied by `make install-monitoring`,
+# not by the main install bundle.
+#
+# The alert that did not exist before this operator:
+#
+# kubelet_volume_stats_used_bytes on a CephFS volume can under-report by up to
+# 100% and stay wrong for months, so "volume almost full" rules built on it are
+# blind. These rules use the MDS-authoritative series instead.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: statfs-guard
+  namespace: statfs-guard
+  labels:
+    app.kubernetes.io/part-of: statfs-guard
+spec:
+  groups:
+    - name: cephfs-statfs-guard
+      rules:
+        - alert: CephFSVolumeAlmostFull
+          # Real fullness, from ceph.dir.rbytes / ceph.quota.max_bytes.
+          expr: |
+            cephfs_guard_volume_used_ratio > 0.85
+            and on (pv, pvc_namespace, pvc)
+            cephfs_guard_volume_probe_success == 1
+          for: 15m
+          labels:
+            severity: critical
+            component: cephfs
+          annotations:
+            summary: >-
+              CephFS PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }} is
+              {{ $value | humanizePercentage }} full
+            description: >-
+              MDS says {{ $labels.pvc }} holds the reported fraction of its
+              {{ "cephfs_guard_volume_quota_bytes" }} quota, on node
+              {{ $labels.node }} (pv {{ $labels.pv }}). This figure comes from
+              ceph.dir.rbytes, not from kubelet, because the kubelet figure is
+              not trustworthy on CephFS.
+
+        - alert: CephFSKubeletFigureUnreliable
+          # Drift was observed and the operator already revalidated the client
+          # cache. Informational: it means monitoring was blind for a while.
+          expr: |
+            cephfs_guard_volume_drift_bytes != 0
+          for: 5m
+          labels:
+            severity: warning
+            component: cephfs
+          annotations:
+            summary: >-
+              kubelet is under-reporting CephFS volume
+              {{ $labels.pvc_namespace }}/{{ $labels.pvc }}
+            description: >-
+              The kubelet-derived figure for pv {{ $labels.pv }} on node
+              {{ $labels.node }} disagrees with the MDS by
+              {{ $value | humanize1024 }}B. Compare
+              cephfs_guard_volume_reported_used_bytes with
+              cephfs_guard_volume_true_used_bytes for the two numbers. If this
+              persists for more than one verify interval the revalidation is not
+              taking effect and the client has to be looked at by hand.
+
+        - alert: CephFSStatfsDriftPersists
+          # A heal was issued and the next pass still disagrees: the read-only
+          # revalidation did not converge, so escalate.
+          expr: |
+            cephfs_guard_volume_phase{phase="Healing"} == 1
+          for: 15m
+          labels:
+            severity: warning
+            component: cephfs
+          annotations:
+            summary: >-
+              CephFS {{ $labels.pvc_namespace }}/{{ $labels.pvc }} stays in an
+              open drift episode after revalidation
+            description: >-
+              Node {{ $labels.node }} has not converged after the agent read
+              ceph.dir.rbytes. Check the agent pod on that node and the MDS
+              health before trusting any usage figure for this volume.
+
+        - alert: CephFSStatfsGuardTruthUnavailable
+          expr: |
+            cephfs_guard_volume_probe_success == 0
+          for: 15m
+          labels:
+            severity: warning
+            component: cephfs
+          annotations:
+            summary: >-
+              No ground truth for CephFS volume
+              {{ $labels.pvc_namespace }}/{{ $labels.pvc }}
+            description: >-
+              Neither the agent on {{ $labels.node }} nor the operator could
+              read the MDS rstat, so nothing is verifying this volume's usage.
+
+        - alert: CephFSStatfsGuardAgentDown
+          # Judged on the operator's own view of the agents rather than on the
+          # scrape job name: job names are assigned by VMPodScrape and would
+          # tie this rule to one particular scrape configuration.
+          expr: |
+            cephfs_guard_agent_up == 0
+          for: 10m
+          labels:
+            severity: warning
+            component: cephfs
+          annotations:
+            summary: statfs-guard agent is down on {{ $labels.node }}
+            description: >-
+              Without the agent nothing revalidates this node's CephFS client
+              cache, so the kubelet usage figures for volumes on this node drift
+              back into being wrong.

@@ -1,0 +1,15 @@
+# Local build output
+/dist/
+/build.log
+*.log
+
+# Editor and tooling state
+.codebuddy/
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db

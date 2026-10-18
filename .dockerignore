@@ -1,0 +1,12 @@
+# Keep the build context to what the compiler actually needs.
+.git
+.github
+.codebuddy
+dist
+deploy
+docs
+hack
+*.md
+*.log
+.gitignore
+.dockerignore

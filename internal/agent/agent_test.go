@@ -1,0 +1,109 @@
+package agent
+
+import (
+	"testing"
+	"time"
+)
+
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"0", 0, false},
+		{"1024", 1024, false},
+		{"1Ki", 1 << 10, false},
+		{"64Mi", 64 << 20, false},
+		{"1Gi", 1 << 30, false},
+		{"2Ti", 2 << 40, false},
+		{"5K", 5 * 1000, false},
+		{"5M", 5 * 1000 * 1000, false},
+		{"5G", 5 * 1000 * 1000 * 1000, false},
+		{"5T", 5 * 1000 * 1000 * 1000 * 1000, false},
+		{"3k", 3 * 1000, false},
+		{"3m", 3 * 1000 * 1000, false},
+		{"3g", 3 * 1000 * 1000 * 1000, false},
+		{"1.5Gi", int64(1.5 * float64(int64(1)<<30)), false},
+		{"", 0, true},
+		{"Mi", 0, true},
+		{"abc", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := ParseByteSize(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ParseByteSize(%q) = %d, want an error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseByteSize(%q): unexpected error %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseByteSize(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestQuotaOrZero pins the conversion that keeps "no quota" (a negative value)
+// from being exported as a negative gauge.
+func TestQuotaOrZero(t *testing.T) {
+	for _, tc := range []struct {
+		in   int64
+		want int64
+	}{
+		{-1, 0},
+		{-4096, 0},
+		{0, 0},
+		{100, 100},
+		{1 << 40, 1 << 40},
+	} {
+		if got := quotaOrZero(tc.in); got != tc.want {
+			t.Fatalf("quotaOrZero(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestAbs64(t *testing.T) {
+	for _, tc := range []struct {
+		in   int64
+		want int64
+	}{
+		{0, 0},
+		{5, 5},
+		{-5, 5},
+		{1 << 40, 1 << 40},
+		{-(1 << 40), 1 << 40},
+	} {
+		if got := abs64(tc.in); got != tc.want {
+			t.Fatalf("abs64(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestNewDefaults documents the values the DaemonSet relies on when it passes
+// no flags at all.
+func TestNewDefaults(t *testing.T) {
+	a := New(Options{})
+	if a.opts.PodsDir != "/var/lib/kubelet/pods" {
+		t.Errorf("PodsDir = %q, want /var/lib/kubelet/pods", a.opts.PodsDir)
+	}
+	if a.opts.Interval != 5*time.Minute {
+		t.Errorf("Interval = %v, want 5m", a.opts.Interval)
+	}
+	if a.opts.ProbeTimeout != 30*time.Second {
+		t.Errorf("ProbeTimeout = %v, want 30s", a.opts.ProbeTimeout)
+	}
+	if a.opts.ListenAddr != ":9101" {
+		t.Errorf("ListenAddr = %q, want :9101", a.opts.ListenAddr)
+	}
+	if a.log == nil {
+		t.Error("Logger was not defaulted")
+	}
+	if a.Samples() == nil {
+		t.Error("Samples() must return an empty slice, not nil")
+	}
+}

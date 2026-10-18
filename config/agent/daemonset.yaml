@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: statfs-guard-agent
+  namespace: statfs-guard
+  labels:
+    app.kubernetes.io/name: statfs-guard-agent
+    app.kubernetes.io/part-of: statfs-guard
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: statfs-guard-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: statfs-guard-agent
+        app.kubernetes.io/part-of: statfs-guard
+      annotations:
+        # Keep the read and its effect close together: the probe revalidates
+        # this node's kernel CephFS client cache.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+    spec:
+      serviceAccountName: statfs-guard-agent
+      priorityClassName: system-node-critical
+      # The agent must land on every node that mounts CephFS, including any
+      # tainted control-plane nodes.
+      tolerations:
+        - operator: Exists
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: agent
+          image: ghcr.io/zzhkhyl/statfs-guard-operator:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/agent"]
+          args:
+            - --probe-interval=5m
+            - --listen=:9101
+            - --pods-dir=/var/lib/kubelet/pods
+          ports:
+            - name: http
+              containerPort: 9101
+              protocol: TCP
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              # A probe is one MDS round trip per volume; the ceiling here only
+              # has to absorb a slow MDS, not real work.
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            # Root is required to traverse kubelet's volume directories and to
+            # read the ceph.dir.* xattrs on them. Nothing is written.
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The path kubelet itself measures, mounted read-only. The agent reads
+        # statfs(2) and ceph.dir.rbytes from here and writes nothing.
+        - name: kubelet-pods
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: tmp
+          emptyDir: {}

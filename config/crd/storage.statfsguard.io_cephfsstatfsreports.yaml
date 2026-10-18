@@ -1,0 +1,144 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cephfsstatfsreports.storage.statfsguard.io
+spec:
+  group: storage.statfsguard.io
+  names:
+    kind: CephFSStatfsReport
+    listKind: CephFSStatfsReportList
+    plural: cephfsstatfsreports
+    singular: cephfsstatfsreport
+    shortNames: [cfsr]
+    categories: [storage]
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Namespace
+          type: string
+          jsonPath: .status.pvcRef.namespace
+        - name: PVC
+          type: string
+          jsonPath: .status.pvcRef.name
+        - name: Node
+          type: string
+          jsonPath: .status.node
+        - name: True
+          type: integer
+          jsonPath: .status.trueBytes
+        - name: Reported
+          type: integer
+          jsonPath: .status.reportedBytes
+        - name: Drift
+          type: integer
+          jsonPath: .status.driftBytes
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: [persistentVolume]
+              properties:
+                persistentVolume:
+                  type: string
+                  minLength: 1
+                  description: Name of the PersistentVolume this report tracks.
+            status:
+              type: object
+              properties:
+                pvcRef:
+                  type: object
+                  required: [namespace, name]
+                  properties:
+                    namespace:
+                      type: string
+                    name:
+                      type: string
+                node:
+                  type: string
+                storageClass:
+                  type: string
+                subvolumePath:
+                  type: string
+                quotaBytes:
+                  type: integer
+                  format: int64
+                trueBytes:
+                  type: integer
+                  format: int64
+                  description: ceph.dir.rbytes, the MDS-authoritative content size.
+                reportedBytes:
+                  type: integer
+                  format: int64
+                  description: What kubelet's statfs-derived metric says.
+                driftBytes:
+                  type: integer
+                  format: int64
+                driftRatio:
+                  type: number
+                  format: double
+                phase:
+                  type: string
+                  enum: [OK, Drifted, Healing, Healed, Error, Skipped]
+                lastProbeTime:
+                  type: string
+                  format: date-time
+                lastHealTime:
+                  type: string
+                  format: date-time
+                staleSince:
+                  type: string
+                  format: date-time
+                worstDriftBytes:
+                  type: integer
+                  format: int64
+                driftEpisodes:
+                  type: integer
+                  format: int64
+                healCount:
+                  type: integer
+                  format: int32
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [type, status, reason, lastTransitionTime]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

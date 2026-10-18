@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: statfs-guard
+  labels:
+    app.kubernetes.io/name: statfs-guard
+---
+# The agent needs no API access at all: it discovers volumes from kubelet's own
+# directory layout and reads only rstat xattrs from a read-only hostPath.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: statfs-guard-agent
+  namespace: statfs-guard
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: statfs-guard-manager
+  namespace: statfs-guard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: statfs-guard-manager
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Reaching the per-node agents through the API server proxy.
+  - apiGroups: [""]
+    resources: ["pods/proxy"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Leader election. controller-runtime v0.21 always locks on
+  # coordination.k8s.io/v1 Lease (pkg/leaderelection/leader_election.go), and
+  # the manager starts with --leader-elect=true. Without this rule the process
+  # runs happily but never acquires leadership, so it reconciles nothing: the
+  # pod looks healthy while every report stays empty.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.statfsguard.io"]
+    resources: ["cephfsstatfsreports"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.statfsguard.io"]
+    resources: ["cephfsstatfsreports/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: statfs-guard-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: statfs-guard-manager
+subjects:
+  - kind: ServiceAccount
+    name: statfs-guard-manager
+    namespace: statfs-guard
