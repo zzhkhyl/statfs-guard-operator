@@ -41,8 +41,13 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: agent
+          # Same reasoning as the manager: :latest is the only tag a
+          # commit-only workflow produces, and IfNotPresent would keep the
+          # old agent binary on every node after a rollout. A stale agent
+          # fails silently (wrong node labels, old probe logic), which is
+          # worse than one extra manifest HEAD per restart.
           image: ghcr.io/zzhkhyl/statfs-guard-operator:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/usr/local/bin/agent"]
           env:
             # The kernel hostname inside a pod is the pod name whenever

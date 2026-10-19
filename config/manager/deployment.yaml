@@ -25,8 +25,14 @@ spec:
         fsGroup: 65532
       containers:
         - name: manager
+          # :latest is mutable and is what a commit-only workflow publishes
+          # (no release tags are created). With IfNotPresent the node keeps
+          # the cached image across rollouts, so a fix merged to main can
+          # never reach the cluster -- that is how the /readyz 404 fix ended
+          # up as a permanently 0/1 Deployment. Always makes any rollout
+          # re-resolve the tag and actually run the new build.
           image: ghcr.io/zzhkhyl/statfs-guard-operator:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/usr/local/bin/manager"]
           args:
             - --leader-elect=true

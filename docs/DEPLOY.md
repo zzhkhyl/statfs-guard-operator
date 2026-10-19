@@ -46,7 +46,31 @@ make bundle
 
 > `deploy/install.yaml` 与 `deploy/monitoring.yaml` 是 `hack/bundle.py` 生成的，**不要手改**，否则下次 `make bundle` 会覆盖掉。
 
-### 2.1 让集群能拉到镜像
+### 2.1 只有提交权限、不能打 tag 时怎么发版
+
+**不需要 git tag。** 合并到 `main` 就会产出镜像，tag 里已经带了 `sha-<短 sha>`：
+
+```text
+ghcr.io/zzhkhyl/statfs-guard-operator:sha-1a2b3c4
+ghcr.io/zzhkhyl/statfs-guard-operator:latest
+```
+
+两份清单用的是 `:latest` + `imagePullPolicy: Always`，这是为「只能 commit、不能打 tag」的权限模型刻意选的：
+
+- `:latest` 是可变 tag，节点上缓存过的同名 tag 在 `IfNotPresent` 下不会再拉 —— 修复合进去了、Pod 也重启了，跑的还是旧二进制。`Always` 让每次滚动都重新解析 tag，拉到新 digest 才启动。
+- 代价是每次重启多一次 manifest HEAD/拉取（层缓存仍在，不是全量下载），可接受。
+- `Always` 只在容器重建时生效：**推送镜像不会自己触发滚动**，CI 跑完之后要主动重启：
+
+```bash
+kubectl apply -f deploy/install.yaml
+kubectl -n statfs-guard rollout restart deploy/statfs-guard-manager ds/statfs-guard-agent
+kubectl -n statfs-guard rollout status deploy/statfs-guard-manager
+kubectl -n statfs-guard rollout status ds/statfs-guard-agent
+```
+
+想留审计线索（「这个 Pod 到底跑的哪个 commit」），把 `image:` 临时钉成 `:sha-<短 sha>` 也可以；`sha-` tag 是不可变的，`IfNotPresent` 照样会拉到新镜像。只是每次发版都得多改一次清单。
+
+### 2.2 让集群能拉到镜像
 
 GHCR 的包默认是**私有**的，公开仓库也一样。二选一：
 
