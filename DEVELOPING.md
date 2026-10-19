@@ -367,6 +367,8 @@ curl -s 'http://<你的 VictoriaMetrics / Prometheus 地址>/api/v1/query?query=
 | 审查-5 | `Discover()` 返回 0 个卷时完全静默（3.7 的静默失效模式） | 每段「空期」输出一次 Warn、恢复时输出一次 Info，避免每 5 分钟刷屏 |
 | 审查-6 | `initialSweep` 可能在 informer 就绪前 list，拿到空结果 | 初版用 `Cache.WaitForCacheSync`，但它只等**已启动**的 informer：informer 还没起来时直接返回 true，扫描仍拿到空列表（实测 20 个 PV 报 `cephfs_pvs: 0`）。现改为 `Reconciler.APIReader`（`mgr.GetAPIReader()`）直连 API server 做一次性 List，彻底不依赖 informer 状态 |
 | 审查-7 | manager 的 `cephfs_guard_*` 指标一条都没导出 | `promauto` 注册到 prometheus **默认**注册表，而 controller-runtime 的 metrics server 服务的是 `sigs.k8s.io/controller-runtime/pkg/metrics.Registry`，两者不通。`:8080/metrics` 只有 controller-runtime 自己的指标，所有 `cephfs_guard_*` 告警永远匹配不到东西。现新增 `metrics.Register(ctrlmetrics.Registry)` 显式注册，并加单测锁住 |
+| 审查-8 | `CephFSKubeletFigureUnreliable` 用 `drift_bytes != 0` | 与容差设计矛盾：实测 20 个卷里 19 个 drift 非 0（中位数 67KB，最大 1MB），全部远低于 64MiB 容差；装上 vmoperator 后会长期对 19 个卷告警，把真正要看的 `CephFSStatfsDriftPersists` 淹没。改为 `abs(drift) > 64MiB or abs(drift_ratio) > 0.05`，与 manager 的 `max(64MiB, 5%)` 对齐 |
+| 审查-9 | `initialSweep` 的日志无法证明扫描真的读到了 PV | `cephfs_pvs` 记的是 `created`，空缓存与「20 个 PV 都已有报告」都输出 `0`，故障时无法区分，静默回归也看不出来。日志改为 `listed/cephfs_pvs/created/other_pvs` 四个数 |
 
 ### 7.2 仍未解决
 

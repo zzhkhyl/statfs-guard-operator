@@ -175,13 +175,14 @@ func (r *Reconciler) initialSweep(ctx context.Context) error {
 	if err := reader.List(ctx, &pvs); err != nil {
 		return fmt.Errorf("list persistent volumes: %w", err)
 	}
-	created, skipped := 0, 0
+	listed, cephfs, created, skipped := len(pvs.Items), 0, 0, 0
 	for i := range pvs.Items {
 		pv := &pvs.Items[i]
 		if !kube.IsCephFSVolume(pv) {
 			skipped++
 			continue
 		}
+		cephfs++
 		var existing storagev1alpha1.CephFSStatfsReport
 		err := r.Get(ctx, types.NamespacedName{Name: pv.Name}, &existing)
 		if err == nil {
@@ -199,7 +200,12 @@ func (r *Reconciler) initialSweep(ctx context.Context) error {
 		}
 		created++
 	}
-	r.Log.Info("initial sweep complete", "cephfs_pvs", created, "other_pvs", skipped)
+	// listed/cephfs are what the API returned; created is only the reports that
+	// did not exist yet. Without the first two numbers a sweep that saw nothing
+	// and a sweep where every report already existed look identical -- which is
+	// exactly the failure this sweep is supposed to make visible.
+	r.Log.Info("initial sweep complete",
+		"listed", listed, "cephfs_pvs", cephfs, "created", created, "other_pvs", skipped)
 	return nil
 }
 

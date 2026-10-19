@@ -93,8 +93,16 @@ spec:
         - alert: CephFSKubeletFigureUnreliable
           # Drift was observed and the operator already revalidated the client
           # cache. Informational: it means monitoring was blind for a while.
+          #
+          # The threshold must mirror the operator's tolerance, max(64MiB, 5% of
+          # truth). `!= 0` looks appealing but fires on nearly every volume every
+          # cycle: CephFS statfs is always a little stale, typically KB-to-MB,
+          # and a permanently paging warning is how the alert that actually
+          # matters (CephFSStatfsDriftPersists) gets muted away.
           expr: |
-            cephfs_guard_volume_drift_bytes != 0
+            abs(cephfs_guard_volume_drift_bytes) > 67108864
+            or
+            abs(cephfs_guard_volume_drift_ratio) > 0.05
           for: 5m
           labels:
             severity: warning
@@ -105,8 +113,8 @@ spec:
               {{ $labels.pvc_namespace }}/{{ $labels.pvc }}
             description: >-
               The kubelet-derived figure for pv {{ $labels.pv }} on node
-              {{ $labels.node }} disagrees with the MDS by
-              {{ $value | humanize1024 }}B. Compare
+              {{ $labels.node }} disagrees with the MDS by more than the
+              configured tolerance (max(64MiB, 5%)). Compare
               cephfs_guard_volume_reported_used_bytes with
               cephfs_guard_volume_true_used_bytes for the two numbers. If this
               persists for more than one verify interval the revalidation is not

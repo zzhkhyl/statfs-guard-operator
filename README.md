@@ -260,8 +260,11 @@ count by (phase) (cephfs_guard_volume_phase == 1)
 # 写满告警。用真值，不用 kubelet —— 这条规则以前根本没法写。
 cephfs_guard_volume_used_ratio > 0.85
 
-# kubelet 在低报。operator 已经修了；持续不收敛说明刷新没生效，要人工看。
-cephfs_guard_volume_drift_bytes != 0
+# kubelet 读数与真值的差距**超出容差**。注意不是 != 0：
+# CephFS 上 KB~MB 级的偏差是常态，用 != 0 会让几乎每个卷每周期都告警。
+abs(cephfs_guard_volume_drift_bytes) > 67108864
+or
+abs(cephfs_guard_volume_drift_ratio) > 0.05
 ```
 
 其余：`CephFSStatfsDriftPersists`（修了不收敛）、`CephFSStatfsGuardTruthUnavailable`（真值取不到）、
