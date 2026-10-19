@@ -26,7 +26,12 @@ spec:
         prometheus.io/port: "9101"
     spec:
       serviceAccountName: statfs-guard-agent
-      priorityClassName: system-node-critical
+      # system-cluster-critical, not system-node-critical: a read-only monitor
+      # has no business sharing a priority tier with kube-apiserver and etcd,
+      # which is what node-critical means on a control-plane node. This still
+      # outranks ordinary workloads and keeps the agent out of the eviction
+      # path while the node is healthy.
+      priorityClassName: system-cluster-critical
       # The agent must land on every node that mounts CephFS, including any
       # tainted control-plane nodes.
       tolerations:

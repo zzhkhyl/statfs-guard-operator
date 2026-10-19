@@ -28,7 +28,9 @@ spec:
         - name: Node
           type: string
           jsonPath: .status.node
-        - name: True
+        # Quoted: unquoted `True` is a YAML 1.1 boolean, and the API server
+        # rejects the whole CRD with "cannot unmarshal bool into ... .name".
+        - name: "True"
           type: integer
           jsonPath: .status.trueBytes
         - name: Reported
