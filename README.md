@@ -152,11 +152,19 @@ kubectl -n statfs-guard get pods -o wide
 kubectl get cfsr -o wide
 ```
 
-监控清单（VictoriaMetrics operator 的 CRD）是**可选的独立一步**，因为集群没装 vmoperator 时它会整份 apply 失败：
+告警规则与抓取清单是两份**独立产物**：
 
 ```bash
+# 1) 告警规则：原生 Prometheus/vmalert 格式，不是 K8s 对象，
+#    交给 Prometheus 的 rule_files 或 vmalert 的 -rule。
+make bundle && cp deploy/rules.yaml <规则目录>/statfs-guard.yaml
+
+# 2) 抓取清单：VictoriaMetrics operator 的 CRD，仅在集群装了 vmoperator 时可用。
 make install-monitoring
 ```
+
+manager 与 agent 的 Pod 都带 `prometheus.io/scrape` 注解，所以走 annotation 发现的
+Prometheus/vmagent 无需额外配置（见 [`docs/DEPLOY.md`](docs/DEPLOY.md) 第四节）。
 
 想自己 build 镜像：
 
@@ -241,6 +249,7 @@ manager（`cephfs_guard_*`，标签含 `pvc_namespace,pvc,storageclass`）：
 | `cephfs_guard_volume_quota_bytes` / `_used_ratio` | 真实充满度 |
 | `cephfs_guard_volume_phase{pv,...,phase}` | 状态机当前相位（切换时旧相位会被置 0） |
 | `cephfs_guard_volume_stale_seconds` | 当前开放 episode 已持续多久 |
+| `cephfs_guard_volume_drift_episodes` | 累计抓到过失真的次数（面板用，不告警） |
 | `cephfs_guard_heal_total` | 修复次数（`issued` / `converged`） |
 | `cephfs_guard_agent_up` | agent 是否应答 |
 
@@ -252,23 +261,22 @@ count by (phase) (cephfs_guard_volume_phase == 1)
 
 ## 八、告警
 
-`config/prometheus/prometheusrule.yaml` 里五条，核心两条。
-（这份清单是 **VMRule**，即 VictoriaMetrics operator 形式，由 `make install-monitoring` 安装，
-不在主体 `deploy/install.yaml` 里，见 [`docs/DEPLOY.md`](docs/DEPLOY.md) 第四节。）
+`config/rules/prometheus-rules.yaml` 里四条，核心一条。规则是**原生 `groups:` 格式**
+（由 `make bundle` 生成 `deploy/rules.yaml`），交给 Prometheus/vmalert 的 rule_files
+加载；它不是 K8s 对象，不能 `kubectl apply`。见 [`docs/DEPLOY.md`](docs/DEPLOY.md) 第四节。
 
 ```promql
 # 写满告警。用真值，不用 kubelet —— 这条规则以前根本没法写。
 cephfs_guard_volume_used_ratio > 0.85
-
-# kubelet 读数与真值的差距**超出容差**。注意不是 != 0：
-# CephFS 上 KB~MB 级的偏差是常态，用 != 0 会让几乎每个卷每周期都告警。
-abs(cephfs_guard_volume_drift_bytes) > 67108864
-or
-abs(cephfs_guard_volume_drift_ratio) > 0.05
+and on (pv, pvc_namespace, pvc) cephfs_guard_volume_probe_success == 1
 ```
 
-其余：`CephFSStatfsDriftPersists`（修了不收敛）、`CephFSStatfsGuardTruthUnavailable`（真值取不到）、
-`CephFSStatfsGuardAgentDown`（agent 挂了，读数会重新变错）。
+其余三条：`CephFSStatfsDriftPersists`（修了不收敛）、`CephFSStatfsGuardTruthUnavailable`
+（真值取不到，已排除 `Skipped`）、`CephFSStatfsGuardAgentDown`（agent 挂了，读数会重新变错）。
+
+**刻意没有** `drift_bytes != 0` 这条：auto-heal 下每个探测周期都会产生 KB~MB 的偏差，
+它要么长期误报、要么因为 `for` 永远等不到而静默失效。「这个卷曾经被低报过」属于历史事实，
+看 `cephfs_guard_volume_drift_episodes > 0`，不适合做告警。
 
 ## 九、边界与不做的事
 
@@ -309,9 +317,11 @@ internal/controller  CephFSStatfsReport 状态机
 internal/kube      PV/PVC/Pod → 节点解析、agent 客户端
 internal/metrics   两组 Prometheus 指标
 api/v1alpha1       CRD 类型（含手写 deepcopy）
-config/            CRD / RBAC / DaemonSet / Deployment / VMPodScrape / VMServiceScrape / VMRule
-deploy/            生成物：install.yaml（主体）+ monitoring.yaml（可选监控）
-hack/bundle.py     把 config/ 合成上面两份（不手抄）
+config/            CRD / RBAC / DaemonSet / Deployment / 原生告警规则（rules/）
+                   + 可选的 VM Operator 抓取对象（prometheus/）
+deploy/            生成物：install.yaml（主体）+ rules.yaml（原生规则）
+                   + monitoring.yaml（可选，需 vmoperator）
+hack/bundle.py     把 config/ 合成上面三份（不手抄）
 docs/DEPLOY.md     部署说明
 .github/workflows  CI：验收 + GHCR 镜像构建
 ```

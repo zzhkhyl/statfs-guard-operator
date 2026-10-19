@@ -1,10 +1,14 @@
-# Scrape configuration in VictoriaMetrics operator form.
+# OPTIONAL. Scrape configuration in VictoriaMetrics operator form.
 #
 # These used to be a PodMonitor and a ServiceMonitor (monitoring.coreos.com),
 # which the VictoriaMetrics operator does not consume. The equivalent objects
 # are VMPodScrape / VMServiceScrape. They live outside deploy/install.yaml
 # (see hack/bundle.py) because applying them on a cluster that has no
 # vmoperator CRDs would fail the whole bundle.
+#
+# Alert rules are NOT here any more: they live in config/rules/ in native
+# Prometheus format, because a cluster can have neither operator and still
+# evaluate rules. See TASKS.md T2.
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:

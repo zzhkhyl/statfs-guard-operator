@@ -125,30 +125,52 @@ kubectl -n statfs-guard get pods -o wide
 
 ---
 
-## 4. 监控（可选，且是独立一步）
+## 4. 监控：抓取与规则是两件独立的事
 
-`config/prometheus/` 下是 **VictoriaMetrics operator** 的 CRD：`VMPodScrape`（agent）、`VMServiceScrape`（manager）、`VMRule`（五条告警）。
+### 4.1 抓取（annotation，默认可用）
 
-它们**不在** `deploy/install.yaml` 里。原因：集群没装 vmoperator 时，apply 会因为找不到 CRD 而让整份清单失败——包括本来完全独立可用的 CRD/RBAC/工作负载。所以监控被拆成单独一份：
+manager 与 agent 的 Pod 模板都带同样的三个注解：
+
+```yaml
+prometheus.io/scrape: "true"
+prometheus.io/port: "9101"     # manager 是 8080
+prometheus.io/path: "/metrics"
+```
+
+只要是 annotation 发现（Prometheus、vmagent 都支持），不需要再配任何 K8s 对象。
+如果用的是静态抓取，直接抓 Pod IP，或用 `kubernetes_sd_configs: role: pod` 加标签过滤。
+
+`config/prometheus/monitors.yaml` 里的 `VMPodScrape` / `VMServiceScrape` 是给
+**装了 VictoriaMetrics operator** 的集群用的可选形态：
 
 ```bash
-# 先确认集群里有这些 CRD
 kubectl get crd | grep operator.victoriametrics.com
-
 make install-monitoring
 ```
 
-如果集群里是 **VictoriaMetrics 单机**（`vmsingle`，没有 operator），上面这些 CRD 用不了。两个替代办法：
+没装 vmoperator 时不要 apply 它，否则整份清单会因为找不到 CRD 而失败。
 
-1. 直接把 DaemonSet 上已经打好的注解当成服务发现来源——agent 的 Pod 模板里已有：
-   ```yaml
-   prometheus.io/scrape: "true"
-   prometheus.io/port: "9101"
-   ```
-   （manager 侧没有这对注解，它的指标在 `8080`，需要单独配一个静态 job 或加同样的注解。）
-2. 在 VM 的 `-promscrape.config` 里加静态 job。
+### 4.2 告警规则（原生格式，与 operator 无关）
 
-> 注意：本仓库的 VMPodScrape **故意不做** `node` 标签的 relabel。agent 导出的每条 series 本来就自带 `node`（值来自 `os.Hostname()`）；再 relabel 一个 `node` 只会在 hostname 与 node 名不完全一致时多出 `exported_node`。如果你的环境里 hostname ≠ node 名，请先把这一点想清楚再动。
+`config/rules/prometheus-rules.yaml` 是**原生 Prometheus/vmalert 规则文件**，`make bundle` 会生成
+`deploy/rules.yaml`。它不是 Kubernetes 对象，**不能 `kubectl apply`**。
+
+规则要由评估规则的组件加载：
+
+```bash
+# Prometheus：把文件放进 rule_files 覆盖的目录，然后 reload
+install -m 0644 deploy/rules.yaml /etc/prometheus/rules/statfs-guard.yaml
+curl -X POST http://<prometheus>:9090/-/reload
+
+# vmalert：加到 -rule（或直接指向该文件）
+vmalert -rule=/etc/vmalert/rules/statfs-guard.yaml ...
+```
+
+四条规则：`CephFSVolumeAlmostFull`、`CephFSStatfsDriftPersists`、
+`CephFSStatfsGuardTruthUnavailable`、`CephFSStatfsGuardAgentDown`。
+刻意没有 `drift_bytes != 0`：auto-heal 下小偏差是每周期常态，做告警只会制造噪声。
+
+> 注意：本仓库的 VMPodScrape **故意不做** `node` 标签的 relabel。agent 导出的每条 series 本来就自带 `node`（来自 downward API 的 `NODE_NAME`，兜底用 `os.Hostname()`）；再 relabel 一个 `node` 只会在两者不一致时多出 `exported_node`。
 
 ---
 

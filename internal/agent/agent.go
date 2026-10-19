@@ -337,13 +337,18 @@ func (a *Agent) sweep(ctx context.Context) {
 	paths, err := a.Discover()
 	if err != nil {
 		a.log.Error("discovery failed", "err", err)
+		// A failed discovery is not "zero mounts", but leaving the last value
+		// in place is worse: dashboards keep showing a healthy mount count for
+		// a node whose agent can no longer see anything. Zero it and let the
+		// log carry the reason.
+		metrics.NodeMounts.WithLabelValues(a.node).Set(0)
 		return
 	}
 
 	a.mu.Lock()
 	a.paths = paths
 	a.mu.Unlock()
-	metrics.NodeMounts.Set(float64(len(paths)))
+	metrics.NodeMounts.WithLabelValues(a.node).Set(float64(len(paths)))
 
 	// Discovering nothing is the silent failure mode described in DEVELOPING
 	// 3.7: a wrong CephFS magic, or a hostPath pointing at the wrong kubelet

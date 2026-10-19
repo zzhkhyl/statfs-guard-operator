@@ -53,9 +53,9 @@ export GOPROXY=https://goproxy.cn,direct GOSUMDB=off GOTOOLCHAIN=local
 make verify             # CI 跑的全套：gofmt / vet / 双平台 build / test / bundle 一致性
 make tidy vet build     # 依赖 + 静态检查 + 交叉编译出 dist/
 make build              # dist/{manager,agent,prober}，linux/amd64
-make bundle             # config/**.yaml -> deploy/install.yaml + deploy/monitoring.yaml
+make bundle             # config/**.yaml -> deploy/{install,rules,monitoring}.yaml
 make install            # = bundle + kubectl apply -f deploy/install.yaml
-make install-monitoring # 只装监控（VMPodScrape/VMServiceScrape/VMRule，需 vmoperator）
+make install-monitoring # 只装抓取对象（VMPodScrape/VMServiceScrape，需 vmoperator）
 make uninstall          # 卸载（含 CRD）
 make reports            # kubectl get cephfsstatfsreports -o wide
 ```
@@ -103,7 +103,7 @@ python hack/bundle.py     # 或 <你的 python.exe 绝对路径> hack/bundle.py
 | | `probeNodes()` | 多节点逐个探测，取 `|drift|` 最大的那个 |
 | | `applyStatus()` | 折叠状态 + 导出指标 + 相位切换时发事件 |
 | | `announce()` | 事件发射 + **冷却节流** |
-| | `exportMetrics()` | **相位标签归零在这里**，见 3.4 |
+| | `exportMetrics()` | **相位标签归零 + 值类指标按相位分流**都在这里，见 3.4 |
 | | `forgetMetrics()` | 删卷时清 series |
 | `internal/kube/agentclient.go` | `AgentPodOn()` / `Probe()` / `Volumes()` | 走 **API server pod proxy**（`pods/<name>:9101/proxy/...`），不依赖 Pod 网络 |
 | | `IsCephFSVolume()` / `SubvolumePath()` | 认 `cephfs.csi.ceph.com`；subvolumePath 从 CSI 属性取 |
@@ -118,8 +118,9 @@ python hack/bundle.py     # 或 <你的 python.exe 绝对路径> hack/bundle.py
 | `config/rbac/rbac.yaml` | Namespace + 两个 SA + ClusterRole（agent **零权限**） |
 | `config/agent/daemonset.yaml` | DaemonSet，hostPath 只读，`runAsUser: 0` |
 | `config/manager/deployment.yaml` | Deployment + metrics Service |
-| `config/prometheus/*.yaml` | VMPodScrape / VMServiceScrape / VMRule（**VictoriaMetrics operator 形式**，见 7.1） |
-| `hack/bundle.py` | 合成**两份**产物：`deploy/install.yaml`（crd→rbac→agent→manager）与 `deploy/monitoring.yaml`（prometheus） |
+| `config/rules/prometheus-rules.yaml` | 告警规则，**原生 `groups:`**，不是 K8s 对象；交给外部 Prometheus/vmalert 的 rule_files |
+| `config/prometheus/*.yaml` | 可选的 VMPodScrape / VMServiceScrape（**VictoriaMetrics operator 形式**，见 7.1） |
+| `hack/bundle.py` | 合成**三份**产物：`deploy/install.yaml`（crd→rbac→agent→manager）、`deploy/rules.yaml`（原生规则）、`deploy/monitoring.yaml`（vmoperator 抓取对象） |
 | `Dockerfile` | 多阶段；三个二进制打进同一个镜像，靠 `command:` 选入口。镜像里的 `USER nonroot` 只对 manager 生效，见 7.1 |
 | `Makefile` | 见 1.3。`REGISTRY`/`IMAGE`/`GOPROXY`/`GOSUMDB`/`GOTOOLCHAIN` 都是 `?=` 可覆盖 |
 | `docs/DEPLOY.md` | 面向部署者的安装/验证/权限说明 |
@@ -131,11 +132,11 @@ python hack/bundle.py     # 或 <你的 python.exe 绝对路径> hack/bundle.py
 
 | 你改了 | 必须同步 |
 |---|---|
-| `internal/metrics/*.go` 的指标名 | ① `README.md` 指标表 ② `config/prometheus/prometheusrule.yaml` 的 expr ③ 上游 Grafana 面板 |
+| `internal/metrics/*.go` 的指标名 | ① `README.md` 指标表 ② `config/rules/prometheus-rules.yaml` 的 expr ③ 上游 Grafana 面板 |
 | 任何 `cmd/*/main.go` 的 flag | ① 对应 `config/*/*.yaml` 的 args ② `README.md` 参数表 |
 | `api/v1alpha1/*_types.go` 的**字段** | ① `zz_generated.deepcopy.go`（**手写，不会自动生成**）② `config/crd/*.yaml` 的 schema |
 | `api/v1alpha1/*_types.go` 的 Phase 常量 | ① `forgetMetrics()` 里的 phase 列表 ② README 的 Phase 表 |
-| `config/**` 任意清单 | 跑 `make bundle` 重生成 `deploy/install.yaml` **与** `deploy/monitoring.yaml`（不手抄） |
+| `config/**` 任意清单 | 跑 `make bundle` 重生成 `deploy/install.yaml`、`deploy/rules.yaml`、`deploy/monitoring.yaml`（不手抄） |
 | `go.mod` 的 module 路径 | 所有 import 前缀（6 个 Go 文件：`internal/{agent,controller,kube}`、`cmd/{agent,manager,prober}`） |
 | `api/v1alpha1` 的 `GroupName` | `config/crd/*.yaml` 的文件名 + `metadata.name` + `spec.group`、`config/rbac/rbac.yaml` 的 `apiGroups`、`cmd/manager/main.go` 的 `LeaderElectionID`、`Makefile` 的 uninstall |
 | `config/agent/daemonset.yaml` 或 `config/manager/deployment.yaml` 的 `image` | CI 推的 tag 策略（见 `.github/workflows/ci.yaml`）与 `docs/DEPLOY.md` 第二节 |
@@ -195,6 +196,19 @@ liveEpisode := abs64(s.Drift) > tolerance
 `count by (phase)(... == 1)` 就会把两个相位都算上。
 所以切换时（或换节点时）要先把 `previous.Phase` 那个 label 组合显式 `Set(0)`；
 卷被删除时要把全部相位（含节点标签）`Delete` 掉。
+
+**相位同时决定值类指标的去留**（`exportMetrics()` 的 switch，改这里要连着看）：
+
+| 相位 | true/reported/drift/quota/used_ratio/episodes | `probe_success` |
+|---|---|---|
+| `OK` / `Healing` / `Healed` / `Drifted` | 正常写入 | 1 |
+| `Error` | **保留上次值**（最后一次已知真值仍有参考价值） | 0 |
+| `Skipped` | **删除 series**，且必须用 `previous.Node`（此时 `st.Node` 为空） | 0 |
+
+`Skipped` 写成 0 会让面板显示「这个卷空了」——那正是本项目要消除的假读数；
+让曲线断掉，人一眼能看出来。`Error` 不能删，否则一次 MDS 抖动就把历史值抹掉。
+单测：`TestExportMetricsSkippedDropsValueSeries` / `TestExportMetricsNodeMoveDropsOldSeries` /
+`TestExportMetricsQuotaRemovedDropsUsedRatio`。
 
 ### 3.5 缓存是 per-node 的
 
@@ -262,11 +276,13 @@ python3 hack/bundle.py
    卡住「改了 config 忘了重生成」。
 7. **改了 CRD 字段** → 手工同步 `zz_generated.deepcopy.go` 与 `config/crd/*.yaml`。
    （没有引入 controller-gen；如果打算引入，见 7.2）
-8. **改了指标名/标签** → 同步 README 表 + `config/prometheus/prometheusrule.yaml`。
+8. **改了指标名/标签** → 同步 README 表 + `config/rules/prometheus-rules.yaml`。
 9. **动了 `internal/cephfs/` 或 `internal/agent/`** → 必须做第 5 节的真机验证，不能只靠编译过。
 10. **改了 `config/prometheus/**`** → 这些是 VictoriaMetrics operator 的 CRD，CI 只校验它们被正确打包，
     **不校验** CRD schema 是否合法。要验证得在装了 vmoperator 的集群上跑
     `kubectl apply --dry-run=server -f deploy/monitoring.yaml`。
+11. **改了 `config/rules/**`** → 它是原生规则文件，CI 只做 YAML 解析。要验证得用
+    `promtool check rules deploy/rules.yaml`（或让 Prometheus/vmalert 实际加载一次）。
 
 ---
 
@@ -353,7 +369,7 @@ curl -s 'http://<你的 VictoriaMetrics / Prometheus 地址>/api/v1/query?query=
 | 原编号 | 原事项 | 处理方式 |
 |---|---|---|
 | 7.1 | `Dockerfile` 的 `USER nonroot` 与 DaemonSet 的 `runAsUser: 0` 读起来矛盾 | 行为本来就是对的（container 级 `securityContext` 覆盖镜像 `USER`）。已在 `Dockerfile` 补齐注释，说明 agent 由 DaemonSet 覆盖为 root 及其理由 |
-| 7.2 | 监控清单是 `monitoring.coreos.com` 的 CRD，而 VictoriaMetrics 默认不认 | 已 1:1 换成 `VMPodScrape` / `VMServiceScrape` / `VMRule`，并拆到独立产物 `deploy/monitoring.yaml`（`make install-monitoring`），未装 vmoperator 的集群不会再被整份 apply 拖垮 |
+| 7.2 | 监控清单是 `monitoring.coreos.com` 的 CRD，而 VictoriaMetrics 默认不认 | 抓取对象已 1:1 换成 `VMPodScrape` / `VMServiceScrape`，放在可选产物 `deploy/monitoring.yaml`（`make install-monitoring`）。告警规则**不再用 VMRule**：改为原生 `groups:` 的 `deploy/rules.yaml`，没有 vmoperator 的集群也能加载 |
 | 7.3 | PodMonitor 的 relabel 可能与指标自带的 `node` 标签打架 | 已**直接去掉**那段 relabel：agent 导出的每条 series 本来就自带 `node`（`os.Hostname()`），再 relabel 一个 `node` 只会多出 `exported_node` |
 | 7.4a | `ConsecutiveDrift` 定义了但从未读写 | 已删除（`api/v1alpha1/statfsreport_types.go` + `config/crd/*.yaml`）。**没有**实现防抖，以免改动相位状态机、触碰 3.3 |
 | 7.4b | 没有任何测试文件，`make test` 空跑 | 已补 `internal/controller/report_controller_test.go` 与 `internal/agent/agent_test.go`（纯函数、零新依赖），并接进 `make verify` 与 CI |
@@ -367,8 +383,12 @@ curl -s 'http://<你的 VictoriaMetrics / Prometheus 地址>/api/v1/query?query=
 | 审查-5 | `Discover()` 返回 0 个卷时完全静默（3.7 的静默失效模式） | 每段「空期」输出一次 Warn、恢复时输出一次 Info，避免每 5 分钟刷屏 |
 | 审查-6 | `initialSweep` 可能在 informer 就绪前 list，拿到空结果 | 初版用 `Cache.WaitForCacheSync`，但它只等**已启动**的 informer：informer 还没起来时直接返回 true，扫描仍拿到空列表（实测 20 个 PV 报 `cephfs_pvs: 0`）。现改为 `Reconciler.APIReader`（`mgr.GetAPIReader()`）直连 API server 做一次性 List，彻底不依赖 informer 状态 |
 | 审查-7 | manager 的 `cephfs_guard_*` 指标一条都没导出 | `promauto` 注册到 prometheus **默认**注册表，而 controller-runtime 的 metrics server 服务的是 `sigs.k8s.io/controller-runtime/pkg/metrics.Registry`，两者不通。`:8080/metrics` 只有 controller-runtime 自己的指标，所有 `cephfs_guard_*` 告警永远匹配不到东西。现新增 `metrics.Register(ctrlmetrics.Registry)` 显式注册，并加单测锁住 |
-| 审查-8 | `CephFSKubeletFigureUnreliable` 用 `drift_bytes != 0` | 与容差设计矛盾：实测 20 个卷里 19 个 drift 非 0（中位数 67KB，最大 1MB），全部远低于 64MiB 容差；装上 vmoperator 后会长期对 19 个卷告警，把真正要看的 `CephFSStatfsDriftPersists` 淹没。改为 `abs(drift) > 64MiB or abs(drift_ratio) > 0.05`，与 manager 的 `max(64MiB, 5%)` 对齐 |
+| 审查-8 | `CephFSKubeletFigureUnreliable` 用 `drift_bytes != 0` | 与容差设计矛盾：实测 20 个卷里 13 个会被任意版本的 `!= 0` / `or` 阈值命中，而最大 drift 不到 8MB，全部远在 64MiB 容差内。auto-heal 下 drift 是每个探测周期的常态产物，做告警必然要么误报、要么因 `for` 等不到而静默。**规则已删除**，历史信息改由新增的 `cephfs_guard_volume_drift_episodes` 在面板呈现 |
 | 审查-9 | `initialSweep` 的日志无法证明扫描真的读到了 PV | `cephfs_pvs` 记的是 `created`，空缓存与「20 个 PV 都已有报告」都输出 `0`，故障时无法区分，静默回归也看不出来。日志改为 `listed/cephfs_pvs/created/other_pvs` 四个数 |
+| 审查-10 | manager 的 `/metrics` 没有任何抓取入口 | 本集群的 Prometheus 走 annotation 发现，而 manager Pod 模板只有 labels。`cephfs_guard_*` 虽然导出正常（审查-7），但永远没人抓。已在 `config/manager/deployment.yaml` 补 `prometheus.io/{scrape,port,path}`，与 agent 一致 |
+| 审查-11 | `Skipped` 相位把值类指标写成 0 | 卷被卸载时 `true_used` 变 0，面板显示「卷空了」，正是本项目要消除的假读数。现按 3.4 的相位表分流：`Skipped` 删 series、`Error` 保留上次值，`probe_success` 显式判断（不再用 `phase != Error`） |
+| 审查-12 | `cephfs_node_mounts` 没有 `node` 标签 | N 个 agent 进程导出同名无标签序列，任何 `sum()` 都无意义。改为 GaugeVec{node}；`Discover()` 失败时先置 0 再返回，避免旧值长期悬挂 |
+| 审查-13 | `initialSweep` 不是 leader-only | `manager.RunnableFunc` 不实现 `LeaderElectionRunnable`，多副本时每个副本都跑一次。现包一层 `leaderOnly`，`NeedLeaderElection()` 返回 true |
 
 ### 7.2 仍未解决
 
@@ -403,9 +423,9 @@ CRD：group storage.statfsguard.io，kind CephFSStatfsReport（短名 cfsr）。
 - 构建必须带 GOPROXY=https://goproxy.cn,direct GOSUMDB=off GOTOOLCHAIN=local
 - 验证用 make verify；它等于：gofmt -l 为空 → GOOS=linux go vet ./... 为 0
   → linux+windows 双平台 go build ./... → go test ./... → hack/bundle.py
-- 动了 config/** 必须跑 python3 hack/bundle.py，重生成 deploy/install.yaml 与
-  deploy/monitoring.yaml，不要手改生成物
-- 改指标名要同步 README 指标表 + config/prometheus/prometheusrule.yaml（VMRule）
+- 动了 config/** 必须跑 python3 hack/bundle.py，重生成 deploy/install.yaml、
+  deploy/rules.yaml 与 deploy/monitoring.yaml，不要手改生成物
+- 改指标名要同步 README 指标表 + config/rules/prometheus-rules.yaml（原生规则，不是 CRD）
 - 改 CRD 字段要同步手写 zz_generated.deepcopy.go + config/crd/*.yaml
 - 改 module 路径或 GroupName 的影响面见第 2.5 节对照表
 - 纯函数有单元测试（internal/controller、internal/agent）；运行时的正确性仍然只靠第 5 节真机验证

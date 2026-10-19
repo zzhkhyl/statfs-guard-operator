@@ -51,7 +51,7 @@ push: ## Push the container image
 	docker push $(IMAGE):latest
 
 .PHONY: bundle
-bundle: ## Regenerate deploy/install.yaml and deploy/monitoring.yaml from config/
+bundle: ## Regenerate deploy/{install,rules,monitoring}.yaml from config/
 	python3 hack/bundle.py
 
 .PHONY: bundle-check

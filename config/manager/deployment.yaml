@@ -16,6 +16,15 @@ spec:
       labels:
         app.kubernetes.io/name: statfs-guard-manager
         app.kubernetes.io/part-of: statfs-guard
+      annotations:
+        # The only place a PVC-labelled, MDS-authoritative fullness figure
+        # exists is this process. The cluster's Prometheus discovers targets by
+        # annotation, so without these three the manager is never scraped and
+        # every cephfs_guard_* alert silently has no input. Agent pods carry the
+        # same annotations (config/agent/daemonset.yaml).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: statfs-guard-manager
       terminationGracePeriodSeconds: 10

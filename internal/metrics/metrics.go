@@ -83,11 +83,14 @@ var (
 		Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
 	}, []string{"node"})
 
-	// NodeMounts is how many CephFS volume mounts the agent can see on this node.
-	NodeMounts = promauto.NewGauge(prometheus.GaugeOpts{
+	// NodeMounts is how many CephFS volume mounts the agent can see on this
+	// node. It carries node because every agent process exports the same name:
+	// without the label, any sum() across targets is meaningless and
+	// `cephfs_node_mounts{node="..."}` cannot be written.
+	NodeMounts = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cephfs_node_mounts",
 		Help: "CephFS volume mounts visible to the agent on this node.",
-	})
+	}, []string{"node"})
 
 	// NodeDriftEpisodesTotal counts how many separate times the volume was
 	// found reporting a stale figure. A nonzero value means the monitoring
@@ -173,6 +176,15 @@ var (
 		Help: "Seconds since drift was first observed for this volume.",
 	}, []string{"pv", "pvc_namespace", "pvc", "node"})
 
+	// VolumeDriftEpisodes is how many separate times this volume was caught
+	// under-reporting. It is the dashboard-facing replacement for the deleted
+	// `drift_bytes != 0` alert: "was blind at some point" is history, not
+	// something that should page on every probe.
+	VolumeDriftEpisodes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "cephfs_guard_volume_drift_episodes",
+		Help: "Distinct stale-reading episodes observed for this volume.",
+	}, []string{"pv", "pvc_namespace", "pvc", "node", "storageclass"})
+
 	// VolumeProbeSuccess mirrors the agent signal for the manager's view.
 	VolumeProbeSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cephfs_guard_volume_probe_success",
@@ -225,6 +237,7 @@ func Register(r prometheus.Registerer) error {
 		VolumeUsedRatio,
 		VolumePhase,
 		VolumeStaleSeconds,
+		VolumeDriftEpisodes,
 		VolumeProbeSuccess,
 		HealTotal,
 		ReconcileErrors,

@@ -32,7 +32,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/zzhkhyl/statfs-guard-operator/api/v1alpha1"
@@ -126,8 +125,19 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	return mgr.Add(manager.RunnableFunc(r.initialSweep))
+	return mgr.Add(leaderOnly{r.initialSweep})
 }
+
+// leaderOnly runs a startup function on the elected leader only.
+//
+// manager.RunnableFunc does not implement manager.LeaderElectionRunnable, so
+// controller-runtime starts it on every replica. With replicas: 1 that is
+// invisible; at 2 it means two concurrent initial sweeps.
+type leaderOnly struct{ fn func(context.Context) error }
+
+func (l leaderOnly) Start(ctx context.Context) error { return l.fn(ctx) }
+
+func (leaderOnly) NeedLeaderElection() bool { return true }
 
 func (r *Reconciler) applyDefaults() {
 	if r.Log == nil {
@@ -602,38 +612,75 @@ func nodeChanged(previous, next storagev1alpha1.CephFSStatfsReportStatus) bool {
 func exportMetrics(report *storagev1alpha1.CephFSStatfsReport, previous storagev1alpha1.CephFSStatfsReportStatus, ns, claim string) {
 	st := report.Status
 
-	// The old label set will never be written again after a move, so drop it.
-	// Freezing it at its last value is what makes a stale `used_ratio` keep
-	// matching `cephfs_guard_volume_used_ratio > 0.85` for a mount that is
-	// gone; zeroing it instead would claim the volume is empty, which is just
-	// another false reading.
-	if nodeChanged(previous, st) {
+	// Value gauges only exist while the volume has a placement and a reading
+	// worth publishing. The cases are deliberate:
+	//
+	//	OK/Healing/Healed/Drifted -> publish this observation
+	//	Error                    -> keep the last known truth; probe_success=0
+	//	                            says it is no longer verified
+	//	Skipped                  -> drop the series; a gap is honest, a zero is
+	//	                            not ("this volume is empty" is a false read)
+	writeValues := st.Phase == storagev1alpha1.PhaseOK ||
+		st.Phase == storagev1alpha1.PhaseHealing ||
+		st.Phase == storagev1alpha1.PhaseHealed ||
+		st.Phase == storagev1alpha1.PhaseDrifted
+
+	// Drop the previous placement only when a new observation replaces it.
+	// On Error the old values must survive; on Skipped the cleanup happens in
+	// the switch below, against previous.Node.
+	if writeValues && nodeChanged(previous, st) {
 		volumeSeries(report.Name, ns, claim, previous.Node, previous.StorageClass)
 	}
 
 	l := []string{report.Name, ns, claim, st.Node, st.StorageClass}
-	metrics.VolumeTrueBytes.WithLabelValues(l...).Set(float64(st.TrueBytes))
-	metrics.VolumeReportedBytes.WithLabelValues(l...).Set(float64(st.ReportedBytes))
-	metrics.VolumeDriftBytes.WithLabelValues(l...).Set(float64(st.DriftBytes))
-	metrics.VolumeDriftRatio.WithLabelValues(l...).Set(st.DriftRatio)
-	metrics.VolumeQuotaBytes.WithLabelValues(l...).Set(float64(max64(st.QuotaBytes, 0)))
-	if st.QuotaBytes > 0 {
-		metrics.VolumeUsedRatio.WithLabelValues(l...).Set(float64(st.TrueBytes) / float64(st.QuotaBytes))
-	} else {
-		// Without a quota the ratio means nothing, and the series must not be
-		// left behind: a value published while a quota still existed would go
-		// on matching `cephfs_guard_volume_used_ratio > 0.85` forever, because
-		// forgetMetrics only runs when the volume itself disappears.
-		metrics.VolumeUsedRatio.DeleteLabelValues(l...)
-	}
-
 	short := []string{report.Name, ns, claim, st.Node}
-	metrics.VolumeProbeSuccess.WithLabelValues(short...).Set(boolToFloat(st.Phase != storagev1alpha1.PhaseError))
-	var stale float64
-	if st.StaleSince != nil {
-		stale = time.Since(st.StaleSince.Time).Seconds()
+
+	switch {
+	case writeValues:
+		metrics.VolumeTrueBytes.WithLabelValues(l...).Set(float64(st.TrueBytes))
+		metrics.VolumeReportedBytes.WithLabelValues(l...).Set(float64(st.ReportedBytes))
+		metrics.VolumeDriftBytes.WithLabelValues(l...).Set(float64(st.DriftBytes))
+		metrics.VolumeDriftRatio.WithLabelValues(l...).Set(st.DriftRatio)
+		metrics.VolumeQuotaBytes.WithLabelValues(l...).Set(float64(max64(st.QuotaBytes, 0)))
+		metrics.VolumeDriftEpisodes.WithLabelValues(l...).Set(float64(st.DriftEpisodes))
+		if st.QuotaBytes > 0 {
+			metrics.VolumeUsedRatio.WithLabelValues(l...).Set(float64(st.TrueBytes) / float64(st.QuotaBytes))
+		} else {
+			// Without a quota the ratio means nothing, and the series must not
+			// be left behind: a value published while a quota still existed
+			// would go on matching `used_ratio > 0.85` forever, because
+			// forgetMetrics only runs when the volume itself disappears.
+			metrics.VolumeUsedRatio.DeleteLabelValues(l...)
+		}
+
+		metrics.VolumeProbeSuccess.WithLabelValues(short...).Set(1)
+		var stale float64
+		if st.StaleSince != nil {
+			stale = time.Since(st.StaleSince.Time).Seconds()
+		}
+		metrics.VolumeStaleSeconds.WithLabelValues(short...).Set(stale)
+
+	case st.Phase == storagev1alpha1.PhaseError:
+		// Keep the last values on purpose: the last known truth is still the
+		// best estimate, and a reader is told it is stale by probe_success=0.
+		// Only write that flag when there is a node to attach it to; an empty
+		// node label would create a series nothing can join on.
+		if st.Node != "" {
+			metrics.VolumeProbeSuccess.WithLabelValues(short...).Set(0)
+		}
+
+	case st.Phase == storagev1alpha1.PhaseSkipped:
+		// st.Node is empty for Skipped, so the series to remove are the ones
+		// under the previous placement. Deleting with st.Node would match
+		// nothing and leave a frozen "last known" value behind.
+		volumeSeries(report.Name, ns, claim, previous.Node, previous.StorageClass)
+		if previous.Node != "" {
+			// volumeSeries also removed probe_success; recreate it at 0. The
+			// "not verified" state is real information, and the alert rule
+			// excludes Skipped explicitly.
+			metrics.VolumeProbeSuccess.WithLabelValues(report.Name, ns, claim, previous.Node).Set(0)
+		}
 	}
-	metrics.VolumeStaleSeconds.WithLabelValues(short...).Set(stale)
 
 	// A phase label set that is left behind would keep reporting 1 forever, so
 	// zero the outgoing phase (and node) before publishing the new one. Use
@@ -655,6 +702,7 @@ func volumeSeries(pv, ns, claim, node, class string) {
 	for _, v := range []*prometheus.GaugeVec{
 		metrics.VolumeTrueBytes, metrics.VolumeReportedBytes, metrics.VolumeDriftBytes,
 		metrics.VolumeDriftRatio, metrics.VolumeQuotaBytes, metrics.VolumeUsedRatio,
+		metrics.VolumeDriftEpisodes,
 	} {
 		v.DeleteLabelValues(l...)
 	}
@@ -674,13 +722,6 @@ func forgetMetrics(pv, ns, claim, node, class string) {
 		metrics.VolumePhase.DeleteLabelValues(pv, ns, claim, node, string(phase))
 	}
 	metrics.AgentUp.DeleteLabelValues(node)
-}
-
-func boolToFloat(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 func ratio(part, whole int64) float64 {

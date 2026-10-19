@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Concatenate config/**.yaml into the install bundles, in apply order.
+"""Concatenate config/**.yaml into the deployable bundles.
 
-The manifests are the source of truth; these bundles exist only so the operator
-can be installed with a single `kubectl apply -f`. Nothing is hand-copied, so a
-bundle cannot drift from config/.
+The manifests are the source of truth; these bundles exist only so nothing has
+to be hand-copied, and a bundle cannot drift from config/.
 
-Two bundles are produced, on purpose:
+Three bundles are produced, on purpose:
 
   deploy/install.yaml     CRD + RBAC + agent + manager. Applies anywhere.
-  deploy/monitoring.yaml  Scrape configs and alert rules, which are
-                          VictoriaMetrics operator CRDs. Only applies on a
-                          cluster that has the vmoperator CRDs installed, so it
-                          is kept out of the main bundle: otherwise the whole
-                          `kubectl apply` fails on a cluster that does not.
+  deploy/rules.yaml       Alert rules in native Prometheus/vmalert format
+                          (bare `groups:`). NOT a Kubernetes object: it is
+                          loaded by the monitoring stack's rule_files, so
+                          `kubectl apply` must never see it.
+  deploy/monitoring.yaml  Scrape configs in VictoriaMetrics operator form.
+                          Only applies on a cluster that has the vmoperator
+                          CRDs, so it is kept out of the main bundle: otherwise
+                          the whole `kubectl apply` fails on a cluster that
+                          does not have them.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ CONFIG = ROOT / "config"
 # Apply order matters: namespace and CRD first, then RBAC, then workloads.
 BUNDLES = (
     ("deploy/install.yaml", ("crd", "rbac", "agent", "manager")),
+    ("deploy/rules.yaml", ("rules",)),
     ("deploy/monitoring.yaml", ("prometheus",)),
 )
 

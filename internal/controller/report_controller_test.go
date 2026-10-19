@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -232,6 +233,210 @@ func TestInitialSweepUsesLiveReader(t *testing.T) {
 	err = cached.Get(context.Background(), types.NamespacedName{Name: "pv-other"}, &report)
 	if err == nil {
 		t.Fatal("a report was created for a non-CephFS volume")
+	}
+}
+
+// The value gauges are exported into prometheus' default registry through
+// promauto, so these tests read it directly. Each test uses its own pv label so
+// cases cannot pollute each other; there is no registry to rebuild.
+
+type metricSample struct {
+	labels map[string]string
+	value  float64
+}
+
+func gatherSamples(t *testing.T, name, pv string) []metricSample {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out []metricSample
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["pv"] != pv {
+				continue
+			}
+			v := 0.0
+			if m.GetGauge() != nil {
+				v = m.GetGauge().GetValue()
+			}
+			out = append(out, metricSample{labels: labels, value: v})
+		}
+	}
+	return out
+}
+
+// TestExportMetricsSkippedDropsValueSeries pins the rule that an unmounted
+// volume disappears from the value gauges instead of reading 0: a dashboards
+// gap is honest, a zero is a false "this volume is empty".
+func TestExportMetricsSkippedDropsValueSeries(t *testing.T) {
+	const (
+		pv    = "test-skip-pv"
+		ns    = "test-ns"
+		claim = "test-claim"
+		node  = "node-a"
+		class = "cephfs"
+	)
+	report := &storagev1alpha1.CephFSStatfsReport{ObjectMeta: metav1.ObjectMeta{Name: pv}}
+	report.Status = storagev1alpha1.CephFSStatfsReportStatus{
+		Phase:         storagev1alpha1.PhaseOK,
+		Node:          node,
+		StorageClass:  class,
+		TrueBytes:     1 << 30,
+		ReportedBytes: 512 << 20,
+		DriftBytes:    512 << 20,
+		QuotaBytes:    2 << 30,
+		DriftEpisodes: 1,
+	}
+	exportMetrics(report, storagev1alpha1.CephFSStatfsReportStatus{}, ns, claim)
+	if got := gatherSamples(t, "cephfs_guard_volume_true_used_bytes", pv); len(got) != 1 {
+		t.Fatalf("precondition: want one true_used series, got %v", got)
+	}
+
+	previous := report.Status
+	report.Status = storagev1alpha1.CephFSStatfsReportStatus{
+		Phase:        storagev1alpha1.PhaseSkipped,
+		StorageClass: class,
+	}
+	exportMetrics(report, previous, ns, claim)
+
+	for _, name := range []string{
+		"cephfs_guard_volume_true_used_bytes",
+		"cephfs_guard_volume_reported_used_bytes",
+		"cephfs_guard_volume_drift_bytes",
+		"cephfs_guard_volume_drift_ratio",
+		"cephfs_guard_volume_drift_episodes",
+		"cephfs_guard_volume_quota_bytes",
+		"cephfs_guard_volume_used_ratio",
+	} {
+		if got := gatherSamples(t, name, pv); len(got) != 0 {
+			t.Fatalf("%s survived Skipped with %v; it must be deleted, not zeroed", name, got)
+		}
+	}
+
+	// probe_success is the one series that must survive: "not verified" is
+	// real information, and it stays on the previous placement's node.
+	got := gatherSamples(t, "cephfs_guard_volume_probe_success", pv)
+	if len(got) != 1 {
+		t.Fatalf("want exactly one probe_success series after Skipped, got %v", got)
+	}
+	if got[0].labels["node"] != node {
+		t.Fatalf("probe_success node = %q, want %q", got[0].labels["node"], node)
+	}
+	if got[0].value != 0 {
+		t.Fatalf("probe_success = %v, want 0 for a Skipped volume", got[0].value)
+	}
+
+	// The phase label is still published for Skipped. The outgoing phase is
+	// explicitly zeroed rather than deleted, so exactly one series should be 1.
+	var active []metricSample
+	for _, s := range gatherSamples(t, "cephfs_guard_volume_phase", pv) {
+		if s.value == 1 {
+			active = append(active, s)
+		}
+	}
+	if len(active) != 1 {
+		t.Fatalf("want exactly one active phase series, got %v", active)
+	}
+	if active[0].labels["phase"] != string(storagev1alpha1.PhaseSkipped) {
+		t.Fatalf("active phase = %q, want Skipped", active[0].labels["phase"])
+	}
+}
+
+// TestExportMetricsNodeMoveDropsOldSeries pins the fix for double counting:
+// after a volume moves from node-a to node-b, `sum by (pv)` must not see both.
+func TestExportMetricsNodeMoveDropsOldSeries(t *testing.T) {
+	const (
+		pv    = "test-move-pv"
+		ns    = "test-ns"
+		claim = "test-claim"
+		class = "cephfs"
+	)
+	report := &storagev1alpha1.CephFSStatfsReport{ObjectMeta: metav1.ObjectMeta{Name: pv}}
+	report.Status = storagev1alpha1.CephFSStatfsReportStatus{
+		Phase:        storagev1alpha1.PhaseOK,
+		Node:         "node-a",
+		StorageClass: class,
+		TrueBytes:    100,
+		QuotaBytes:   1000,
+	}
+	exportMetrics(report, storagev1alpha1.CephFSStatfsReportStatus{}, ns, claim)
+
+	previous := report.Status
+	report.Status = storagev1alpha1.CephFSStatfsReportStatus{
+		Phase:        storagev1alpha1.PhaseOK,
+		Node:         "node-b",
+		StorageClass: class,
+		TrueBytes:    200,
+		QuotaBytes:   1000,
+	}
+	exportMetrics(report, previous, ns, claim)
+
+	for _, name := range []string{
+		"cephfs_guard_volume_true_used_bytes",
+		"cephfs_guard_volume_drift_bytes",
+		"cephfs_guard_volume_drift_episodes",
+		"cephfs_guard_volume_quota_bytes",
+		"cephfs_guard_volume_used_ratio",
+	} {
+		got := gatherSamples(t, name, pv)
+		if len(got) != 1 {
+			t.Fatalf("%s: want exactly the node-b series, got %v", name, got)
+		}
+		if got[0].labels["node"] != "node-b" {
+			t.Fatalf("%s still carries node=%q", name, got[0].labels["node"])
+		}
+	}
+}
+
+// TestExportMetricsQuotaRemovedDropsUsedRatio pins that removing a quota does
+// not leave used_ratio frozen at its last value, where it would keep matching
+// the almost-full alert on a denominator that no longer exists.
+func TestExportMetricsQuotaRemovedDropsUsedRatio(t *testing.T) {
+	const (
+		pv    = "test-quota-pv"
+		ns    = "test-ns"
+		claim = "test-claim"
+		node  = "node-a"
+		class = "cephfs"
+	)
+	report := &storagev1alpha1.CephFSStatfsReport{ObjectMeta: metav1.ObjectMeta{Name: pv}}
+	report.Status = storagev1alpha1.CephFSStatfsReportStatus{
+		Phase:        storagev1alpha1.PhaseOK,
+		Node:         node,
+		StorageClass: class,
+		TrueBytes:    900 << 20,
+		QuotaBytes:   1 << 30,
+	}
+	exportMetrics(report, storagev1alpha1.CephFSStatfsReportStatus{}, ns, claim)
+	if got := gatherSamples(t, "cephfs_guard_volume_used_ratio", pv); len(got) != 1 {
+		t.Fatalf("precondition: want a used_ratio series, got %v", got)
+	}
+
+	previous := report.Status
+	report.Status = storagev1alpha1.CephFSStatfsReportStatus{
+		Phase:        storagev1alpha1.PhaseOK,
+		Node:         node,
+		StorageClass: class,
+		TrueBytes:    900 << 20,
+		QuotaBytes:   0,
+	}
+	exportMetrics(report, previous, ns, claim)
+
+	if got := gatherSamples(t, "cephfs_guard_volume_used_ratio", pv); len(got) != 0 {
+		t.Fatalf("used_ratio survived quota removal: %v", got)
+	}
+	got := gatherSamples(t, "cephfs_guard_volume_quota_bytes", pv)
+	if len(got) != 1 || got[0].value != 0 {
+		t.Fatalf("quota_bytes = %v, want a single series at 0", got)
 	}
 }
 
