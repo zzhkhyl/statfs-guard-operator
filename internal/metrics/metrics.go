@@ -13,6 +13,8 @@
 package metrics
 
 import (
+	"errors"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -202,3 +204,41 @@ var (
 		Buckets: []float64{.01, .05, .1, .25, .5, 1, 2.5, 5, 10},
 	}, []string{"node", "endpoint"})
 )
+
+// Register adds the manager-side collectors (cephfs_guard_*) to r. Calling it
+// more than once for the same registry is harmless.
+//
+// This is not optional plumbing. controller-runtime's metrics server gathers
+// sigs.k8s.io/controller-runtime/pkg/metrics.Registry, which is a *different*
+// registry from prometheus' default one. promauto registers into the default
+// registry, so without this call the manager serves controller-runtime's own
+// metrics and not a single cephfs_guard_* series -- every alert rule built on
+// them silently matches nothing. The agent is unaffected: it serves the
+// default registry through promhttp.Handler().
+func Register(r prometheus.Registerer) error {
+	collectors := []prometheus.Collector{
+		VolumeTrueBytes,
+		VolumeReportedBytes,
+		VolumeDriftBytes,
+		VolumeDriftRatio,
+		VolumeQuotaBytes,
+		VolumeUsedRatio,
+		VolumePhase,
+		VolumeStaleSeconds,
+		VolumeProbeSuccess,
+		HealTotal,
+		ReconcileErrors,
+		AgentUp,
+		AgentRequestSeconds,
+	}
+	for _, c := range collectors {
+		if err := r.Register(c); err != nil {
+			var already prometheus.AlreadyRegisteredError
+			if errors.As(err, &already) {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}

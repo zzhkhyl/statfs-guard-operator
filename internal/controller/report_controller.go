@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -98,17 +97,22 @@ type Reconciler struct {
 	// ExcludeNamespaces skips claims in these namespaces.
 	ExcludeNamespaces map[string]bool
 
-	// Cache is the manager's informer cache. initialSweep waits on it before
-	// listing, because Reconciler only embeds client.Client and therefore has
-	// no other way to know whether the informers are already serving.
-	Cache cache.Cache
+	// APIReader reads straight from the API server, bypassing the informer
+	// cache. initialSweep must use it: the manager starts runnables
+	// concurrently, and a cache-backed List issued before the PV informer has
+	// served its first list returns an empty result with no error
+	// (WaitForCacheSync only waits for informers that have already started).
+	// That made the sweep log "cephfs_pvs: 0" on a cluster with 20 PVs, and
+	// would have skipped every pre-existing volume had the PV watch not
+	// replayed them as Add events.
+	APIReader client.Reader
 }
 
 // SetupWithManager registers the reconciler, its watches and an initial sweep
 // so volumes that already existed at install time are picked up.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.applyDefaults()
-	r.Cache = mgr.GetCache()
+	r.APIReader = mgr.GetAPIReader()
 
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, PodPVCIndex, PodPVCIndexFunc); err != nil {
 		return fmt.Errorf("index pods by claim: %w", err)
@@ -155,17 +159,20 @@ func pvToRequest(_ context.Context, obj client.Object) []reconcile.Request {
 }
 
 // initialSweep creates reports for volumes that existed before the operator.
+//
+// It reads through APIReader (a live API call) rather than the cached client on
+// purpose: a cached List before the informers started returns an empty result,
+// silently leaving every existing volume unreported. The sweep runs once per
+// process start, so one direct List is cheap.
 func (r *Reconciler) initialSweep(ctx context.Context) error {
-	// A cache-backed List before the informers are serving returns an empty
-	// result rather than an error, which would silently leave every existing
-	// volume unreported until something else touched it.
-	if r.Cache != nil && !r.Cache.WaitForCacheSync(ctx) {
-		r.Log.Info("cache did not sync, skipping the initial sweep; the PV watch will catch up")
-		return nil
+	reader := r.APIReader
+	if reader == nil {
+		// Only reachable from tests that construct a Reconciler by hand.
+		reader = r.Client
 	}
 
 	var pvs corev1.PersistentVolumeList
-	if err := r.List(ctx, &pvs); err != nil {
+	if err := reader.List(ctx, &pvs); err != nil {
 		return fmt.Errorf("list persistent volumes: %w", err)
 	}
 	created, skipped := 0, 0

@@ -1,14 +1,21 @@
 package controller
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "github.com/zzhkhyl/statfs-guard-operator/api/v1alpha1"
+	"github.com/zzhkhyl/statfs-guard-operator/internal/kube"
 )
 
 const (
@@ -171,6 +178,60 @@ func TestNodeChanged(t *testing.T) {
 				t.Fatalf("nodeChanged(%+v, %+v) = %v, want %v", tc.previous, tc.next, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestInitialSweepUsesLiveReader pins the fix for a sweep that reported
+// "cephfs_pvs: 0" on a cluster with 20 volumes: the cached client can be empty
+// at that moment because the informers have not served their first list yet.
+// The sweep must read from the API server, not the cache.
+func TestInitialSweepUsesLiveReader(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := storagev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add statfsguard scheme: %v", err)
+	}
+
+	pv := func(name, driver string) *corev1.PersistentVolume {
+		return &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{Driver: driver},
+				},
+			},
+		}
+	}
+
+	// Client stands in for an informer cache that has not listed anything yet.
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	live := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(pv("pv-ceph", kube.CephDriver), pv("pv-other", "other.csi.example.com")).
+		Build()
+
+	r := &Reconciler{
+		Client:    cached,
+		APIReader: live,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := r.initialSweep(context.Background()); err != nil {
+		t.Fatalf("initialSweep: %v", err)
+	}
+
+	var report storagev1alpha1.CephFSStatfsReport
+	err := cached.Get(context.Background(), types.NamespacedName{Name: "pv-ceph"}, &report)
+	if err != nil {
+		t.Fatalf("no report created for the CephFS volume: %v", err)
+	}
+	if report.Spec.PersistentVolume != "pv-ceph" {
+		t.Fatalf("report points at %q, want pv-ceph", report.Spec.PersistentVolume)
+	}
+
+	err = cached.Get(context.Background(), types.NamespacedName{Name: "pv-other"}, &report)
+	if err == nil {
+		t.Fatal("a report was created for a non-CephFS volume")
 	}
 }
 

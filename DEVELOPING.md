@@ -365,7 +365,8 @@ curl -s 'http://<你的 VictoriaMetrics / Prometheus 地址>/api/v1/query?query=
 | 审查-3 | agent 侧删卷后 3 组 series 不清理 | `sweep()` 的 Gone 循环补齐 `NodeDriftEpisodesTotal` / `NodeEpisodeSeconds` / `NodeRevalidateTotal`；counter 需按 `ok`、`error` 两个取值分别删 |
 | 审查-4 | agent 的 HTTP server 没有任何超时 | 补 `ReadHeaderTimeout` / `ReadTimeout` / `IdleTimeout`；`WriteTimeout = probeTimeout + 30s`，因为 `/v1/probe` 是同步探测，写死会在调大 `--probe-timeout` 后截断响应 |
 | 审查-5 | `Discover()` 返回 0 个卷时完全静默（3.7 的静默失效模式） | 每段「空期」输出一次 Warn、恢复时输出一次 Info，避免每 5 分钟刷屏 |
-| 审查-6 | `initialSweep` 可能在 informer 就绪前 list，拿到空结果 | `Reconciler` 新增 `Cache` 字段（它只内嵌 `client.Client`，没有 `GetCache()`），`SetupWithManager` 注入，扫描前 `WaitForCacheSync` |
+| 审查-6 | `initialSweep` 可能在 informer 就绪前 list，拿到空结果 | 初版用 `Cache.WaitForCacheSync`，但它只等**已启动**的 informer：informer 还没起来时直接返回 true，扫描仍拿到空列表（实测 20 个 PV 报 `cephfs_pvs: 0`）。现改为 `Reconciler.APIReader`（`mgr.GetAPIReader()`）直连 API server 做一次性 List，彻底不依赖 informer 状态 |
+| 审查-7 | manager 的 `cephfs_guard_*` 指标一条都没导出 | `promauto` 注册到 prometheus **默认**注册表，而 controller-runtime 的 metrics server 服务的是 `sigs.k8s.io/controller-runtime/pkg/metrics.Registry`，两者不通。`:8080/metrics` 只有 controller-runtime 自己的指标，所有 `cephfs_guard_*` 告警永远匹配不到东西。现新增 `metrics.Register(ctrlmetrics.Registry)` 显式注册，并加单测锁住 |
 
 ### 7.2 仍未解决
 

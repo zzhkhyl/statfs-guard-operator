@@ -14,11 +14,13 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	storagev1alpha1 "github.com/zzhkhyl/statfs-guard-operator/api/v1alpha1"
 	"github.com/zzhkhyl/statfs-guard-operator/internal/controller"
 	"github.com/zzhkhyl/statfs-guard-operator/internal/kube"
+	"github.com/zzhkhyl/statfs-guard-operator/internal/metrics"
 )
 
 var version = "dev"
@@ -62,6 +64,15 @@ func main() {
 			logger.Error("register scheme", "err", err)
 			os.Exit(1)
 		}
+	}
+
+	// The metrics server below serves controller-runtime's registry, not
+	// prometheus' default one. Register the cephfs_guard_* collectors there,
+	// otherwise :8080 exports only controller-runtime's own metrics and every
+	// alert based on cephfs_guard_* silently matches nothing.
+	if err := metrics.Register(ctrlmetrics.Registry); err != nil {
+		logger.Error("register manager metrics", "err", err)
+		os.Exit(1)
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
