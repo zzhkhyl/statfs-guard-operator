@@ -101,14 +101,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	for _, h := range []struct {
-		path string
-		fn   healthz.Checker
-	}{{"/healthz", healthz.Ping}, {"/readyz", healthz.Ping}} {
-		if err := mgr.AddHealthzCheck(h.path, h.fn); err != nil {
-			logger.Error("add health check", "path", h.path, "err", err)
-			os.Exit(1)
-		}
+	// These are two separate registries. Registering "/readyz" through
+	// AddHealthzCheck leaves the readyz handler unmounted, so the kubelet's
+	// readiness probe gets a 404 and the Deployment never becomes Ready.
+	if err := mgr.AddHealthzCheck("ping", healthz.Ping); err != nil {
+		logger.Error("add liveness check", "err", err)
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("ping", healthz.Ping); err != nil {
+		logger.Error("add readiness check", "err", err)
+		os.Exit(1)
 	}
 
 	logger.Info("statfs-guard manager starting",

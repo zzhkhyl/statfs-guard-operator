@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,9 @@ type Options struct {
 	ListenAddr string
 	// ProbeTimeout bounds a single probe.
 	ProbeTimeout time.Duration
+	// NodeName is the Kubernetes node this agent runs on, stamped on every
+	// sample and series. Defaults to detectedNodeName().
+	NodeName string
 	// Logger receives structured logs.
 	Logger *slog.Logger
 }
@@ -115,6 +119,10 @@ type Agent struct {
 	// period instead of one every interval. Only sweep touches it, and sweep
 	// runs on the single Run goroutine.
 	mountsWarned bool
+
+	// node is the Kubernetes node name, resolved once at startup. See
+	// detectedNodeName for why it must not just be os.Hostname().
+	node string
 }
 
 // New builds an Agent with sane defaults applied.
@@ -131,6 +139,9 @@ func New(opts Options) *Agent {
 	if opts.ProbeTimeout <= 0 {
 		opts.ProbeTimeout = 30 * time.Second
 	}
+	if opts.NodeName == "" {
+		opts.NodeName = detectedNodeName()
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -142,6 +153,7 @@ func New(opts Options) *Agent {
 		episodes:     map[string]int64{},
 		episodeStart: map[string]time.Time{},
 		episodeWorst: map[string]int64{},
+		node:         opts.NodeName,
 	}
 }
 
@@ -180,7 +192,7 @@ func (a *Agent) Discover() (map[string]string, error) {
 // Probe measures one volume. Read it as: observe, and by observing, heal.
 func (a *Agent) Probe(ctx context.Context, pv, path string) Sample {
 	start := time.Now()
-	s := Sample{PV: pv, Path: path, Node: hostMust(), ProbedAt: start}
+	s := Sample{PV: pv, Path: path, Node: a.node, ProbedAt: start}
 
 	type result struct {
 		stat    cephfs.RStat
@@ -385,7 +397,7 @@ func (a *Agent) sweep(ctx context.Context) {
 	// here: that would discard the history of every other volume still living
 	// on this node.
 	for _, pv := range stale {
-		node := hostMust()
+		node := a.node
 		labels := []string{pv, node}
 		metrics.NodeTruthBytes.DeleteLabelValues(labels...)
 		metrics.NodeTruthFiles.DeleteLabelValues(labels...)
@@ -524,7 +536,21 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-func hostMust() string {
+// detectedNodeName returns the Kubernetes node this agent runs on.
+//
+// os.Hostname() alone is not enough. With hostNetwork set to false — the
+// DaemonSet's setting — the kernel hostname inside the pod is the *pod* name,
+// so every series would be labelled node="statfs-guard-agent-vsn2b" while the
+// manager labels the same volume with the real node name from spec.nodeName.
+// The two never join, and the node label changes on every DaemonSet rollout.
+//
+// The DaemonSet therefore injects NODE_NAME from spec.nodeName through the
+// downward API. Falling back to the hostname keeps a bare `agent` run directly
+// on a node (README §四) producing sensible labels.
+func detectedNodeName() string {
+	if n := strings.TrimSpace(os.Getenv("NODE_NAME")); n != "" {
+		return n
+	}
 	h, err := os.Hostname()
 	if err != nil {
 		return "unknown"

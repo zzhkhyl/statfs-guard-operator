@@ -44,6 +44,15 @@ spec:
           image: ghcr.io/zzhkhyl/statfs-guard-operator:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/agent"]
+          env:
+            # The kernel hostname inside a pod is the pod name whenever
+            # hostNetwork is false, which would make every series carry a
+            # node label like "statfs-guard-agent-vsn2b" and change on every
+            # rollout. Take the real node name from the API instead.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           args:
             - --probe-interval=5m
             - --listen=:9101

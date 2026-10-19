@@ -84,6 +84,43 @@ func TestAbs64(t *testing.T) {
 	}
 }
 
+// TestDetectedNodeName pins the fallback order that keeps the agent's `node`
+// label equal to the manager's: inside a pod with hostNetwork false the kernel
+// hostname is the pod name, so NODE_NAME from the downward API must win.
+func TestDetectedNodeName(t *testing.T) {
+	t.Setenv("NODE_NAME", "node-1")
+	if got := detectedNodeName(); got != "node-1" {
+		t.Fatalf("detectedNodeName() = %q, want node-1", got)
+	}
+
+	t.Setenv("NODE_NAME", "   ")
+	got := detectedNodeName()
+	if got == "" || got == "   " {
+		t.Fatalf("blank NODE_NAME should fall back to the hostname, got %q", got)
+	}
+
+	t.Setenv("NODE_NAME", "")
+	if got := detectedNodeName(); got == "" {
+		t.Fatal("empty NODE_NAME should fall back to the hostname")
+	}
+}
+
+func TestNewResolvesNodeName(t *testing.T) {
+	t.Setenv("NODE_NAME", "node-7")
+	a := New(Options{})
+	if a.opts.NodeName != "node-7" {
+		t.Fatalf("Options.NodeName = %q, want node-7", a.opts.NodeName)
+	}
+	if a.node != "node-7" {
+		t.Fatalf("agent node = %q, want node-7", a.node)
+	}
+
+	b := New(Options{NodeName: "explicit"})
+	if b.node != "explicit" {
+		t.Fatalf("explicit NodeName was overridden: %q", b.node)
+	}
+}
+
 // TestNewDefaults documents the values the DaemonSet relies on when it passes
 // no flags at all.
 func TestNewDefaults(t *testing.T) {
